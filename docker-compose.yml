@@ -8,6 +8,8 @@ services:
       POSTGRES_USER: techhire
       POSTGRES_PASSWORD: localdev
       POSTGRES_DB: techhire_db
+    ports:
+      - "5433:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
