@@ -1,8 +1,12 @@
 import os
 import asyncio
+import json as json_lib
+import re as re_module
 from datetime import datetime, timedelta, timezone
-from fastapi import FastAPI, Query, HTTPException
+from typing import Optional
+from fastapi import FastAPI, Query, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from sqlalchemy import select, or_, and_, func, text
 from dotenv import load_dotenv
 from db.session import init_db, SessionLocal
@@ -393,6 +397,178 @@ async def get_job_summary(job_id: int, refresh: bool = False):
         session.commit()
 
         return {"summary": final, "cached": False}
+
+
+# ── Resume PDF extraction ────────────────────────────────────────────────────
+
+@app.post("/resume/extract-text")
+async def extract_resume_text(file: UploadFile = File(...)):
+    """Extract plain text from a PDF or TXT upload. Handles LaTeX-generated PDFs."""
+    if not file.filename:
+        raise HTTPException(400, "No file provided")
+
+    data = await file.read()
+    fname = file.filename.lower()
+
+    if fname.endswith('.txt') or file.content_type == 'text/plain':
+        try:
+            return {"text": data.decode('utf-8', errors='replace')}
+        except Exception as e:
+            raise HTTPException(422, f"Could not read text file: {e}")
+
+    if fname.endswith('.pdf') or file.content_type == 'application/pdf':
+        try:
+            import io
+            import pdfplumber
+            text_parts = []
+            with pdfplumber.open(io.BytesIO(data)) as pdf:
+                for page in pdf.pages:
+                    t = page.extract_text(x_tolerance=2, y_tolerance=2)
+                    if t:
+                        text_parts.append(t)
+            text = '\n'.join(text_parts).strip()
+            if not text:
+                raise HTTPException(422, "PDF appears to have no extractable text (scanned image?)")
+            return {"text": text}
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(422, f"Could not extract PDF text: {e}")
+
+    raise HTTPException(415, "Only PDF and TXT files are supported")
+
+
+# ── Resume compatibility checker ────────────────────────────────────────────
+
+class ResumeRequest(BaseModel):
+    resume_text: str
+    job_description: Optional[str] = None
+    job_id: Optional[int] = None
+
+
+_RESUME_SYSTEM = (
+    "You are an expert resume coach specializing in software engineering roles. "
+    "Analyze the resume against the job description and return ONLY a valid JSON object — "
+    "no markdown, no code fences, no text outside the JSON."
+)
+
+_RESUME_PROMPT = """\
+Analyze this resume against the job description and return the following JSON (no extra text):
+{{
+  "score": <integer 0-100>,
+  "score_reasoning": "<one concise sentence explaining the score>",
+  "matched_skills": ["<skill>"],
+  "missing_skills": ["<skill>"],
+  "sections": {{
+    "summary": {{
+      "found": <true|false>,
+      "issues": "<what needs improvement, or null>",
+      "rewrite": "<improved version aligned to the job, or null>"
+    }},
+    "skills": {{
+      "found": <true|false>,
+      "issues": "<what is weak or absent>",
+      "to_add": ["<skill>"],
+      "suggestion": "<how to restructure the skills section>"
+    }},
+    "experience": {{
+      "found": <true|false>,
+      "issues": "<overall weakness>",
+      "rewrites": [
+        {{"before": "<original bullet>", "after": "<improved bullet>", "reason": "<why>"}}
+      ]
+    }},
+    "education": {{
+      "found": <true|false>,
+      "issues": "<issue or null>",
+      "suggestion": "<advice or null>"
+    }},
+    "projects": {{
+      "found": <true|false>,
+      "issues": "<issue or null>",
+      "suggestion": "<advice on what to add or highlight>"
+    }}
+  }},
+  "top_suggestions": ["<suggestion 1>", "<suggestion 2>", "<suggestion 3>"]
+}}
+
+RESUME:
+---
+{resume}
+---
+
+JOB DESCRIPTION:
+---
+{job}
+---"""
+
+
+def _extract_json(text: str) -> dict:
+    """Parse JSON from model output, tolerating markdown code fences."""
+    try:
+        return json_lib.loads(text)
+    except Exception:
+        pass
+    # Strip ```json ... ``` wrappers
+    stripped = re_module.sub(r'^```(?:json)?\s*|\s*```$', '', text.strip(), flags=re_module.MULTILINE)
+    try:
+        return json_lib.loads(stripped)
+    except Exception:
+        pass
+    # Last resort: grab first {...} block
+    m = re_module.search(r'\{[\s\S]*\}', text)
+    if m:
+        try:
+            return json_lib.loads(m.group(0))
+        except Exception:
+            pass
+    raise ValueError("Could not parse JSON from model response")
+
+
+@app.post("/resume/analyze")
+async def analyze_resume(req: ResumeRequest):
+    api_key = os.getenv("GROQ_API_KEY", "")
+    if not api_key or api_key == "your_groq_api_key_here":
+        raise HTTPException(503, "GROQ_API_KEY not configured — add it to .env")
+
+    job_desc = (req.job_description or "").strip()
+
+    if req.job_id and not job_desc:
+        with SessionLocal() as session:
+            j = session.get(JobListing, req.job_id)
+            if j:
+                job_desc = j.description or f"{j.title} at {j.company}"
+
+    if not job_desc:
+        raise HTTPException(400, "job_description or job_id is required")
+
+    resume_text = req.resume_text[:5000]
+    job_text    = job_desc[:3000]
+
+    prompt = _RESUME_PROMPT.format(resume=resume_text, job=job_text)
+
+    from groq import Groq
+    client = Groq(api_key=api_key)
+    loop   = asyncio.get_event_loop()
+
+    def _sync():
+        resp = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            max_tokens=2000,
+            temperature=0.1,
+            messages=[
+                {"role": "system", "content": _RESUME_SYSTEM},
+                {"role": "user",   "content": prompt},
+            ],
+        )
+        return resp.choices[0].message.content.strip()
+
+    try:
+        raw    = await loop.run_in_executor(None, _sync)
+        result = _extract_json(raw)
+        return result
+    except Exception as e:
+        raise HTTPException(500, f"Analysis failed: {e}")
 
 
 @app.get("/health")
